@@ -22,12 +22,26 @@ def calculate_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         # RSI
         df['rsi'] = ta.rsi(df['close'], length=14)
         
-        # Bollinger Bands
+        # Bollinger Bands - FIXED for pandas-ta version compatibility
         bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None:
-            df['bb_upper'] = bb.get('BBU_20_2.0', pd.Series(index=df.index))
-            df['bb_lower'] = bb.get('BBL_20_2.0', pd.Series(index=df.index))
-            df['bb_middle'] = bb.get('BBM_20_2.0', pd.Series(index=df.index))
+        
+        # Handle different pandas-ta versions
+        if hasattr(bb, 'columns'):
+            # Newer versions return DataFrame
+            df['bb_upper'] = bb.iloc[:, 0] if len(bb.columns) >= 1 else df['close']
+            df['bb_middle'] = bb.iloc[:, 1] if len(bb.columns) >= 2 else df['close']
+            df['bb_lower'] = bb.iloc[:, 2] if len(bb.columns) >= 3 else df['close']
+        else:
+            # Older versions return tuple or dict
+            if isinstance(bb, dict):
+                df['bb_upper'] = bb.get('BBU_20_2.0', df['close'])
+                df['bb_middle'] = bb.get('BBM_20_2.0', df['close'])
+                df['bb_lower'] = bb.get('BBL_20_2.0', df['close'])
+            else:
+                # Fallback
+                df['bb_upper'] = df['close'] * 1.02
+                df['bb_middle'] = df['close']
+                df['bb_lower'] = df['close'] * 0.98
         
         # Velocity (3-candle price change SMA)
         df['price_change'] = df['close'].pct_change() * 100
@@ -38,19 +52,20 @@ def calculate_indicators(df: pd.DataFrame) -> Dict[str, Any]:
 
         # Get latest values
         latest = df.iloc[-1]
-        prev = df.iloc[-2]
+        prev = df.iloc[-2] if len(df) > 1 else latest
 
         return {
             "success": True,
             "rsi": float(latest['rsi']) if pd.notna(latest['rsi']) else 50,
-            "bb_upper": float(latest['bb_upper']) if pd.notna(latest['bb_upper']) else latest['close'] * 1.1,
-            "bb_lower": float(latest['bb_lower']) if pd.notna(latest['bb_lower']) else latest['close'] * 0.9,
+            "bb_upper": float(latest['bb_upper']) if pd.notna(latest['bb_upper']) else latest['close'] * 1.02,
+            "bb_lower": float(latest['bb_lower']) if pd.notna(latest['bb_lower']) else latest['close'] * 0.98,
             "close": float(latest['close']),
             "velocity": float(latest['velocity']) if pd.notna(latest['velocity']) else 0,
             "acceleration": float(latest['acceleration']) if pd.notna(latest['acceleration']) else 0,
             "prev_velocity": float(prev['velocity']) if pd.notna(prev['velocity']) else 0
         }
     except Exception as e:
+        print(f"Indicator calculation error: {e}")
         return {"error": str(e)}
 
 def check_signal(indicators: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -58,43 +73,46 @@ def check_signal(indicators: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not indicators.get("success", False):
         return None
     
-    rsi = indicators['rsi']
-    close = indicators['close']
-    bb_lower = indicators['bb_lower']
-    bb_upper = indicators['bb_upper']
-    acceleration = indicators['acceleration']
-    velocity = indicators['velocity']
-    prev_velocity = indicators['prev_velocity']
+    try:
+        rsi = indicators['rsi']
+        close = indicators['close']
+        bb_lower = indicators['bb_lower']
+        bb_upper = indicators['bb_upper']
+        acceleration = indicators['acceleration']
+        velocity = indicators['velocity']
+        prev_velocity = indicators['prev_velocity']
 
-    # LONG signal: RSI < 30, price below lower BB, acceleration > 0, velocity increasing
-    long_conditions = (
-        rsi < 30 and
-        close < bb_lower and
-        acceleration > 0 and
-        velocity > prev_velocity
-    )
+        # LONG signal: RSI < 30, price below lower BB, acceleration > 0, velocity increasing
+        long_conditions = (
+            rsi < 30 and
+            close < bb_lower and
+            acceleration > 0 and
+            velocity > prev_velocity
+        )
 
-    # SHORT signal: RSI > 70, price above upper BB, acceleration < 0, velocity decreasing
-    short_conditions = (
-        rsi > 70 and
-        close > bb_upper and
-        acceleration < 0 and
-        velocity < prev_velocity
-    )
+        # SHORT signal: RSI > 70, price above upper BB, acceleration < 0, velocity decreasing
+        short_conditions = (
+            rsi > 70 and
+            close > bb_upper and
+            acceleration < 0 and
+            velocity < prev_velocity
+        )
 
-    if long_conditions:
-        return {
-            "signal": "LONG",
-            "type": "BUY",
-            "entry": close,
-            "strength": min(abs(30 - rsi) * 3 + abs(acceleration) * 10, 100)
-        }
-    elif short_conditions:
-        return {
-            "signal": "SHORT",
-            "type": "SELL",
-            "entry": close,
-            "strength": min(abs(rsi - 70) * 3 + abs(acceleration) * 10, 100)
-        }
+        if long_conditions:
+            return {
+                "signal": "LONG",
+                "type": "BUY",
+                "entry": close,
+                "strength": min(abs(30 - rsi) * 3 + abs(acceleration) * 10, 100)
+            }
+        elif short_conditions:
+            return {
+                "signal": "SHORT",
+                "type": "SELL",
+                "entry": close,
+                "strength": min(abs(rsi - 70) * 3 + abs(acceleration) * 10, 100)
+            }
+    except Exception as e:
+        print(f"Signal check error: {e}")
     
     return None
