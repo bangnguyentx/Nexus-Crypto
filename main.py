@@ -2,27 +2,26 @@ import os
 import asyncio
 import logging
 import threading
-import random
+import json
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
+import random
+import time
 
+import pandas as pd
+import numpy as np
 import ccxt
 import ccxt.async_support as ccxt_async
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, jsonify
 
-from storage import Storage
-# Thay thế: import analysis
-from indicators import calculate_indicators_simple as calculate_indicators
-from indicators import check_signal  # giữ nguyên check_signal nếu có
-
-# ==================== CONFIG ====================
+# ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8322194930:AAEbemqNTWGAKoLwl23bwziKatEb6jx5ZIM")
 PORT = int(os.getenv("PORT", 10000))
 SCAN_INTERVAL = 300  # 5 minutes
 
-# Multiple exchanges to avoid IP blocking
+# Multiple exchanges for load balancing
 EXCHANGES = [
     {"id": "binance", "class": ccxt_async.binance},
     {"id": "bybit", "class": ccxt_async.bybit},
@@ -30,25 +29,125 @@ EXCHANGES = [
     {"id": "okx", "class": ccxt_async.okx},
 ]
 
-# Symbols to scan (15 coins)
+# 15 coins to scan
 SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "DOGE/USDT",
     "XRP/USDT", "ETC/USDT", "LTC/USDT", "BCH/USDT", "BNB/USDT",
     "ADA/USDT", "XMR/USDT", "DASH/USDT", "ZEC/USDT", "AVAX/USDT"
 ]
 
-# Vietnamese day names
+# Vietnamese days
 VIETNAMESE_DAYS = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
 
-# ==================== LOGGING ====================
+# ==================== SETUP LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ==================== STORAGE ====================
-storage = Storage()
+# ==================== STORAGE MANAGER ====================
+class UserStorage:
+    def __init__(self, filename="users.json"):
+        self.filename = filename
+        self.lock = threading.Lock()
+        self._init_storage()
+    
+    def _init_storage(self):
+        """Initialize storage file"""
+        if not os.path.exists(self.filename):
+            with self.lock:
+                with open(self.filename, 'w') as f:
+                    json.dump({}, f)
+    
+    def add_user(self, user_id: int, username: str = ""):
+        """Add new user"""
+        with self.lock:
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+            except:
+                data = {}
+            
+            if str(user_id) not in data:
+                data[str(user_id)] = {
+                    "username": username,
+                    "joined": datetime.now().isoformat(),
+                    "active": True,
+                    "signal_count": 0,
+                    "last_signal": None
+                }
+                
+                with open(self.filename, 'w') as f:
+                    json.dump(data, f, indent=2)
+                return True
+        return False
+    
+    def get_active_users(self) -> List[int]:
+        """Get list of active user IDs"""
+        with self.lock:
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+            except:
+                return []
+            
+            return [int(uid) for uid, user_data in data.items() 
+                   if user_data.get("active", False)]
+    
+    def increment_signal_count(self, user_id: int):
+        """Increment signal count for user"""
+        with self.lock:
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+            except:
+                return
+            
+            uid = str(user_id)
+            if uid in data:
+                data[uid]["signal_count"] = data[uid].get("signal_count", 0) + 1
+                data[uid]["last_signal"] = datetime.now().isoformat()
+                
+                with open(self.filename, 'w') as f:
+                    json.dump(data, f, indent=2)
+    
+    def deactivate_user(self, user_id: int):
+        """Deactivate user (if blocked bot)"""
+        with self.lock:
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+            except:
+                return
+            
+            uid = str(user_id)
+            if uid in data:
+                data[uid]["active"] = False
+                
+                with open(self.filename, 'w') as f:
+                    json.dump(data, f, indent=2)
+    
+    def get_stats(self) -> Dict:
+        """Get system statistics"""
+        with self.lock:
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+            except:
+                return {"total_users": 0, "active_users": 0, "total_signals": 0}
+            
+            active = sum(1 for user in data.values() if user.get("active", False))
+            total_signals = sum(user.get("signal_count", 0) for user in data.values())
+            
+            return {
+                "total_users": len(data),
+                "active_users": active,
+                "total_signals": total_signals
+            }
+
+# Initialize storage
+storage = UserStorage()
 
 # ==================== FLASK APP ====================
 app = Flask(__name__)
@@ -57,88 +156,280 @@ app = Flask(__name__)
 def home():
     stats = storage.get_stats()
     return f"""
+    <!DOCTYPE html>
     <html>
-        <head>
-            <title>Signal Bot - Auto Scanner</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 40px; background: #0f172a; color: white; }}
-                .container {{ max-width: 800px; margin: 0 auto; }}
-                .card {{ background: #1e293b; padding: 20px; border-radius: 10px; margin: 20px 0; }}
-                .stat {{ display: inline-block; margin: 10px 20px; }}
-                .value {{ font-size: 24px; color: #60a5fa; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🤖 Signal Trading Bot</h1>
-                <div class="card">
-                    <h3>📊 System Status</h3>
-                    <div class="stat">Active Users: <span class="value">{stats['active_users']}</span></div>
-                    <div class="stat">Total Signals: <span class="value">{stats['total_signals']}</span></div>
-                    <p>🔄 Scanning 15 coins every 5 minutes</p>
-                    <p>⚡ Using multiple exchanges to avoid rate limits</p>
+    <head>
+        <title>📈 Signal Trading Bot</title>
+        <style>
+            body {{
+                font-family: 'Segoe UI', Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                min-height: 100vh;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 0 auto;
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 40px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            }}
+            h1 {{ margin-top: 0; color: white; }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin: 30px 0;
+            }}
+            .stat-card {{
+                background: rgba(255, 255, 255, 0.2);
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 2.5em;
+                font-weight: bold;
+                color: #4ade80;
+            }}
+            .stat-label {{
+                font-size: 0.9em;
+                opacity: 0.8;
+                margin-top: 5px;
+            }}
+            .info-box {{
+                background: rgba(255, 255, 255, 0.15);
+                padding: 20px;
+                border-radius: 10px;
+                margin-top: 30px;
+            }}
+            .symbol-list {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                margin-top: 10px;
+            }}
+            .symbol {{
+                background: rgba(255, 255, 255, 0.2);
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-size: 0.9em;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 Signal Trading Bot</h1>
+            <p>Auto-scanning 15 cryptocurrencies every 5 minutes</p>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value">{stats['total_users']}</div>
+                    <div class="stat-label">Total Users</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{stats['active_users']}</div>
+                    <div class="stat-label">Active Users</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{stats['total_signals']}</div>
+                    <div class="stat-label">Signals Sent</div>
                 </div>
             </div>
-        </body>
+            
+            <div class="info-box">
+                <h3>📊 System Status: <span style="color:#4ade80">✅ ACTIVE</span></h3>
+                <p>🔄 Scanning interval: 5 minutes</p>
+                <p>⚡ Using 4 exchanges for reliability</p>
+                <p>⏰ Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                
+                <h4>📈 Tracking Coins:</h4>
+                <div class="symbol-list">
+                    {' '.join(f'<div class="symbol">{s.replace("/USDT", "")}</div>' for s in SYMBOLS)}
+                </div>
+            </div>
+            
+            <div style="margin-top: 30px; font-size: 0.9em; opacity: 0.7; text-align: center;">
+                <p>Bot Token: {TELEGRAM_TOKEN[:10]}... | Running on Render</p>
+            </div>
+        </div>
+    </body>
     </html>
     """
 
 @app.route('/health')
-def health():
+def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "service": "signal-bot"
+        "service": "signal-bot",
+        "active_users": storage.get_stats()["active_users"]
     })
 
-@app.route('/stats')
-def stats():
-    return jsonify(storage.get_stats())
+# ==================== TECHNICAL INDICATORS ====================
+class TechnicalIndicators:
+    @staticmethod
+    def calculate_rsi(prices: List[float], period: int = 14) -> float:
+        """Calculate RSI manually"""
+        if len(prices) < period + 1:
+            return 50.0
+        
+        deltas = np.diff(prices[-period-1:])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return float(rsi)
+    
+    @staticmethod
+    def calculate_bollinger_bands(prices: List[float], period: int = 20, std_dev: int = 2) -> Dict:
+        """Calculate Bollinger Bands"""
+        if len(prices) < period:
+            current_price = prices[-1] if prices else 100
+            return {
+                "upper": current_price * 1.02,
+                "middle": current_price,
+                "lower": current_price * 0.98
+            }
+        
+        recent_prices = prices[-period:]
+        middle = np.mean(recent_prices)
+        std = np.std(recent_prices)
+        
+        return {
+            "upper": middle + (std * std_dev),
+            "middle": middle,
+            "lower": middle - (std * std_dev)
+        }
+    
+    @staticmethod
+    def calculate_velocity(prices: List[float], period: int = 3) -> float:
+        """Calculate velocity (rate of price change)"""
+        if len(prices) < period + 1:
+            return 0.0
+        
+        changes = []
+        for i in range(-period, 0):
+            if i < -1:
+                change = ((prices[i] - prices[i-1]) / prices[i-1]) * 100
+                changes.append(change)
+        
+        return float(np.mean(changes)) if changes else 0.0
+    
+    @staticmethod
+    def analyze_symbol(prices: List[float]) -> Optional[Dict]:
+        """Analyze symbol and return signal if any"""
+        if len(prices) < 50:
+            return None
+        
+        try:
+            # Calculate indicators
+            rsi = TechnicalIndicators.calculate_rsi(prices)
+            bb = TechnicalIndicators.calculate_bollinger_bands(prices)
+            velocity = TechnicalIndicators.calculate_velocity(prices)
+            
+            # Calculate acceleration (change in velocity)
+            last_3_prices = prices[-4:-1] if len(prices) >= 5 else prices[-3:]
+            prev_velocity = TechnicalIndicators.calculate_velocity(last_3_prices, period=2)
+            acceleration = velocity - prev_velocity
+            
+            current_price = prices[-1]
+            
+            # Signal conditions
+            long_conditions = (
+                rsi < 30 and
+                current_price < bb["lower"] and
+                acceleration > 0 and
+                velocity > prev_velocity
+            )
+            
+            short_conditions = (
+                rsi > 70 and
+                current_price > bb["upper"] and
+                acceleration < 0 and
+                velocity < prev_velocity
+            )
+            
+            if long_conditions:
+                signal_strength = min(abs(30 - rsi) * 3 + abs(acceleration) * 10, 100)
+                return {
+                    "signal": "LONG",
+                    "entry": current_price,
+                    "rsi": rsi,
+                    "velocity": velocity,
+                    "acceleration": acceleration,
+                    "strength": signal_strength
+                }
+            elif short_conditions:
+                signal_strength = min(abs(rsi - 70) * 3 + abs(acceleration) * 10, 100)
+                return {
+                    "signal": "SHORT",
+                    "entry": current_price,
+                    "rsi": rsi,
+                    "velocity": velocity,
+                    "acceleration": acceleration,
+                    "strength": signal_strength
+                }
+                
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
+        
+        return None
 
 # ==================== HELPER FUNCTIONS ====================
 def get_vietnamese_day() -> str:
-    """Get current Vietnamese day name"""
-    day_index = datetime.now().weekday()  # Monday=0, Sunday=6
+    """Get current day in Vietnamese"""
+    day_index = datetime.now().weekday()
     return VIETNAMESE_DAYS[day_index]
 
-def calculate_tp_sl(signal_type: str, entry_price: float) -> Dict[str, float]:
-    """Calculate Take Profit and Stop Loss levels"""
+def calculate_tp_sl(signal_type: str, entry_price: float) -> Dict:
+    """Calculate Take Profit and Stop Loss"""
     if signal_type == "LONG":
-        # TP: +2%, SL: -1% (RR 2:1)
-        tp = entry_price * 1.02
-        sl = entry_price * 0.99
-        rr_ratio = 2.0
+        tp = entry_price * 1.02  # +2%
+        sl = entry_price * 0.99  # -1%
+        rr = 2.0
     else:  # SHORT
-        # TP: -2%, SL: +1% (RR 2:1)
-        tp = entry_price * 0.98
-        sl = entry_price * 1.01
-        rr_ratio = 2.0
+        tp = entry_price * 0.98  # -2%
+        sl = entry_price * 1.01  # +1%
+        rr = 2.0
     
     return {
-        "tp": round(tp, 4),
-        "sl": round(sl, 4),
-        "rr_ratio": rr_ratio
+        "tp": round(tp, 4 if entry_price < 100 else 2),
+        "sl": round(sl, 4 if entry_price < 100 else 2),
+        "rr": rr
     }
 
-def format_signal_message(symbol: str, signal_data: Dict, levels: Dict) -> str:
-    """Format the signal message"""
+def format_price(price: float) -> str:
+    """Format price based on value"""
+    if price < 1:
+        return f"{price:.6f}"
+    elif price < 100:
+        return f"{price:.4f}"
+    else:
+        return f"{price:.2f}"
+
+def format_signal_message(symbol: str, signal_data: Dict) -> str:
+    """Format the final signal message"""
     day_name = get_vietnamese_day()
     coin_name = symbol.replace("/USDT", "")
     
-    # Format entry price based on coin value
-    entry_price = signal_data['entry']
-    if entry_price < 1:
-        entry_fmt = f"{entry_price:.6f}"
-        tp_fmt = f"{levels['tp']:.6f}"
-        sl_fmt = f"{levels['sl']:.6f}"
-    elif entry_price < 100:
-        entry_fmt = f"{entry_price:.4f}"
-        tp_fmt = f"{levels['tp']:.4f}"
-        sl_fmt = f"{levels['sl']:.4f}"
-    else:
-        entry_fmt = f"{entry_price:.2f}"
-        tp_fmt = f"{levels['tp']:.2f}"
-        sl_fmt = f"{levels['sl']:.2f}"
+    levels = calculate_tp_sl(signal_data["signal"], signal_data["entry"])
+    
+    entry_fmt = format_price(signal_data["entry"])
+    tp_fmt = format_price(levels["tp"])
+    sl_fmt = format_price(levels["sl"])
     
     message = f"""🤖 Tín hiệu {day_name}
 #{coin_name} – {signal_data['signal']} 📌
@@ -146,7 +437,7 @@ def format_signal_message(symbol: str, signal_data: Dict, levels: Dict) -> str:
 🔴 Entry: {entry_fmt}
 🆗 Take Profit: {tp_fmt}
 🙅‍♂️ Stop-Loss: {sl_fmt}
-🪙 Tỉ lệ RR: {levels['rr_ratio']:.1f}
+🪙 Tỉ lệ RR: {levels['rr']:.1f}
 
 🧠 By Tool Bot
 
@@ -154,8 +445,8 @@ def format_signal_message(symbol: str, signal_data: Dict, levels: Dict) -> str:
     
     return message
 
-async def fetch_ohlcv(exchange_class, symbol: str, timeframe: str = "5m", limit: int = 100):
-    """Fetch OHLCV data from exchange with error handling"""
+async def fetch_ohlcv_data(exchange_class, symbol: str) -> Optional[List[float]]:
+    """Fetch OHLCV data from exchange"""
     exchange = exchange_class({
         'enableRateLimit': True,
         'options': {'defaultType': 'future'}
@@ -163,80 +454,52 @@ async def fetch_ohlcv(exchange_class, symbol: str, timeframe: str = "5m", limit:
     
     try:
         await exchange.load_markets()
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        ohlcv = await exchange.fetch_ohlcv(symbol, '5m', limit=100)
         await exchange.close()
-        return ohlcv
+        
+        # Extract closing prices
+        prices = [float(candle[4]) for candle in ohlcv]  # [timestamp, o, h, l, close, volume]
+        return prices
     except Exception as e:
-        logger.error(f"Error fetching {symbol} from {exchange_class.__name__}: {e}")
+        logger.error(f"Error fetching {symbol}: {e}")
         await exchange.close()
         return None
 
 # ==================== SCANNER ====================
 class SignalScanner:
-    def __init__(self, bot_application):
-        self.bot_app = bot_application
+    def __init__(self, bot_app):
+        self.bot_app = bot_app
         self.running = False
-        self.last_scan_time = None
+        self.indicators = TechnicalIndicators()
         
-    async def scan_symbols(self):
-        """Scan all symbols for signals"""
-        logger.info(f"🔍 Starting scan... (Active users: {len(storage.get_users())})")
-        
-        # Distribute symbols among exchanges
-        symbols_per_exchange = len(SYMBOLS) // len(EXCHANGES) + 1
-        
-        for i, exchange_config in enumerate(EXCHANGES):
-            exchange_class = exchange_config["class"]
-            start_idx = i * symbols_per_exchange
-            end_idx = min(start_idx + symbols_per_exchange, len(SYMBOLS))
-            exchange_symbols = SYMBOLS[start_idx:end_idx]
+    async def scan_symbol(self, symbol: str, exchange_class) -> bool:
+        """Scan a single symbol for signals"""
+        try:
+            # Fetch data
+            prices = await fetch_ohlcv_data(exchange_class, symbol)
+            if not prices or len(prices) < 50:
+                return False
             
-            if not exchange_symbols:
-                continue
+            # Analyze
+            signal = self.indicators.analyze_symbol(prices)
+            
+            if signal and signal.get("strength", 0) > 40:
+                # Send to all users
+                await self.send_signal(symbol, signal)
+                return True
                 
-            for symbol in exchange_symbols:
-                try:
-                    # Fetch data
-                    ohlcv = await fetch_ohlcv(exchange_class, symbol)
-                    if not ohlcv:
-                        continue
-                    
-                    # Convert to DataFrame and analyze
-                    df = analysis.ohlcv_to_df(ohlcv)
-                    indicators = analysis.calculate_indicators(df)
-                    
-                    if indicators.get("error"):
-                        continue
-                    
-                    # Check for signal
-                    signal = analysis.check_signal(indicators)
-                    
-                    if signal and signal.get("strength", 0) > 50:  # Only send strong signals
-                        await self.send_signal_to_users(symbol, signal)
-                        # Small delay to avoid rate limits
-                        await asyncio.sleep(1)
-                        
-                except Exception as e:
-                    logger.error(f"Error scanning {symbol}: {e}")
-                    continue
-                    
-                # Small delay between symbols
-                await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Scan error for {symbol}: {e}")
         
-        self.last_scan_time = datetime.now()
-        logger.info(f"✅ Scan completed at {self.last_scan_time}")
+        return False
     
-    async def send_signal_to_users(self, symbol: str, signal_data: Dict):
+    async def send_signal(self, symbol: str, signal_data: Dict):
         """Send signal to all active users"""
-        # Calculate TP/SL levels
-        levels = calculate_tp_sl(signal_data['signal'], signal_data['entry'])
+        message = format_signal_message(symbol, signal_data)
+        users = storage.get_active_users()
         
-        # Format message
-        message = format_signal_message(symbol, signal_data, levels)
-        
-        # Send to all active users
-        users = storage.get_users()
         success_count = 0
+        failed_users = []
         
         for user_id in users:
             try:
@@ -247,117 +510,197 @@ class SignalScanner:
                 storage.increment_signal_count(user_id)
                 success_count += 1
                 
-                # Small delay between messages
+                # Small delay to avoid rate limits
                 await asyncio.sleep(0.1)
                 
             except Exception as e:
-                logger.warning(f"Failed to send to user {user_id}: {e}")
-                # If user blocked the bot, mark as inactive
-                if "bot was blocked" in str(e) or "chat not found" in str(e):
-                    storage.remove_user(user_id)
+                error_msg = str(e).lower()
+                if "blocked" in error_msg or "chat not found" in error_msg:
+                    failed_users.append(user_id)
+                logger.warning(f"Failed to send to {user_id}: {e}")
+        
+        # Deactivate blocked users
+        for user_id in failed_users:
+            storage.deactivate_user(user_id)
         
         if success_count > 0:
-            logger.info(f"📨 Sent {signal_data['signal']} signal for {symbol} to {success_count} users")
+            logger.info(f"✅ Sent {signal_data['signal']} signal for {symbol} to {success_count} users")
+    
+    async def run_scan(self):
+        """Run one complete scan of all symbols"""
+        logger.info(f"🔍 Starting scan... (Active users: {len(storage.get_active_users())})")
+        
+        # Distribute symbols among exchanges
+        symbols_per_exchange = max(1, len(SYMBOLS) // len(EXCHANGES))
+        
+        for i, exchange_config in enumerate(EXCHANGES):
+            exchange_class = exchange_config["class"]
+            exchange_name = exchange_config["id"]
+            
+            start_idx = i * symbols_per_exchange
+            end_idx = min(start_idx + symbols_per_exchange, len(SYMBOLS))
+            exchange_symbols = SYMBOLS[start_idx:end_idx]
+            
+            if not exchange_symbols:
+                continue
+            
+            logger.info(f"📊 Using {exchange_name} for {len(exchange_symbols)} symbols")
+            
+            for symbol in exchange_symbols:
+                try:
+                    signal_found = await self.scan_symbol(symbol, exchange_class)
+                    if signal_found:
+                        # Wait a bit after sending signal
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    logger.error(f"Error processing {symbol}: {e}")
+                
+                # Small delay between symbols
+                await asyncio.sleep(0.5)
+        
+        logger.info("✅ Scan completed")
     
     async def run(self):
         """Main scanner loop"""
         self.running = True
-        logger.info("🚀 Signal Scanner started")
+        logger.info("🚀 Signal Scanner started successfully!")
         
+        scan_count = 0
         while self.running:
             try:
-                await self.scan_symbols()
+                scan_count += 1
+                logger.info(f"🔄 Scan #{scan_count}")
+                
+                await self.run_scan()
+                
+                # Wait for next scan interval
+                for _ in range(SCAN_INTERVAL):
+                    if not self.running:
+                        break
+                    await asyncio.sleep(1)
+                    
             except Exception as e:
-                logger.error(f"Scanner error: {e}")
-            
-            # Wait for next scan interval
-            for i in range(SCAN_INTERVAL):
-                if not self.running:
-                    break
-                await asyncio.sleep(1)
-        
-        logger.info("🛑 Signal Scanner stopped")
+                logger.error(f"Scanner loop error: {e}")
+                await asyncio.sleep(60)  # Wait 1 minute on error
     
     def stop(self):
         self.running = False
+        logger.info("🛑 Scanner stopped")
 
 # ==================== TELEGRAM HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    user_id = update.effective_user.id
-    storage.add_user(user_id)
+    user = update.effective_user
+    added = storage.add_user(user.id, user.username or user.first_name)
     
-    welcome_message = """🚀 **SIGNAL TRADING BOT**
+    if added:
+        welcome_msg = """🚀 **SIGNAL TRADING BOT**
 
-Chào mừng bạn đến với bot gửi tín hiệu giao dịch tự động!
+✅ Đăng ký thành công!
 
-📊 **Tôi sẽ gửi tín hiệu cho 15 coins:**
+📊 **Tôi sẽ gửi tín hiệu tự động cho 15 coins:**
 BTC, ETH, SOL, LINK, DOGE, XRP, ETC, LTC, BCH, BNB, ADA, XMR, DASH, ZEC, AVAX
 
-⏰ **Quét tự động mỗi 5 phút**
-🎯 **Thuật toán Physics Momentum**
-⚡ **Sử dụng đa sàn để tránh bị chặn**
+⏰ **Quét mỗi 5 phút, 24/7**
+🎯 **Physics Momentum Algorithm**
+⚡ **Sử dụng đa sàn: Binance, Bybit, Bitget, OKX**
 
-Bot sẽ tự động gửi tín hiệu khi phát hiện cơ hội tốt. Không cần thiết lập gì thêm!
+Bot sẽ tự động gửi tín hiệu khi phát hiện cơ hội tốt!
 
-Chúc bạn trade an toàn và hiệu quả! 🎯"""
-    
-    await update.message.reply_text(welcome_message, parse_mode='Markdown')
+📈 **Mỗi tín hiệu bao gồm:**
+• Entry chính xác
+• Take Profit mục tiêu
+• Stop Loss an toàn
+• Tỉ lệ Risk/Reward
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
-    help_message = """📖 **HƯỚNG DẪN SỬ DỤNG**
-
-Bot hoạt động hoàn toàn tự động:
-• Quét 15 coins mỗi 5 phút
-• Gửi tín hiệu khi phát hiện cơ hội
-• Format đầy đủ Entry, TP, SL, RR
-
-🔹 **Các lệnh có sẵn:**
-/start - Đăng ký nhận tín hiệu
-/help - Hiển thị hướng dẫn
-/stats - Thống kê bot
-
-⚡ **Lưu ý quan trọng:**
+⚠️ **Lưu ý quan trọng:**
 • Chỉ trade với risk 2-3% mỗi lệnh
 • Dừng sau 3 lệnh thắng liên tiếp
 • Bot chỉ để tham khảo, tự chịu trách nhiệm
 
+Chúc bạn trade an toàn và hiệu quả! 🎯"""
+    else:
+        welcome_msg = """✅ Bạn đã đăng ký rồi!
+
+Bot sẽ tiếp tục gửi tín hiệu tự động khi phát hiện cơ hội.
+
+Sử dụng /help để xem hướng dẫn
+Sử dụng /stats để xem thống kê"""
+    
+    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """📖 **HƯỚNG DẪN SỬ DỤNG**
+
+🤖 **Cách hoạt động:**
+• Bot tự động quét 15 coins mỗi 5 phút
+• Khi có tín hiệu, gửi ngay cho tất cả user
+• Không cần thiết lập gì thêm
+
+📊 **Coins được theo dõi:**
+BTC, ETH, SOL, LINK, DOGE, XRP, ETC, LTC, BCH, BNB, ADA, XMR, DASH, ZEC, AVAX
+
+⚡ **Lệnh có sẵn:**
+/start - Đăng ký nhận tín hiệu
+/help - Hiển thị hướng dẫn này
+/stats - Xem thống kê bot
+
+🎯 **Quản lý rủi ro:**
+• Mỗi lệnh chỉ risk 2-3% tài khoản
+• Stop Loss bắt buộc phải đặt
+• Dừng giao dịch sau 3 lệnh thắng
+• Bot chỉ để tham khảo, tự chịu trách nhiệm
+
+💡 **Mẹo:**
+• Chờ xác nhận thêm từ khung thời gian cao hơn
+• Kết hợp với phân tích cơ bản
+• Không FOMO, tuân thủ kỷ luật
+
 Chúc bạn trade thành công! 💪"""
     
-    await update.message.reply_text(help_message, parse_mode='Markdown')
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stats command"""
     stats = storage.get_stats()
-    user_id = update.effective_user.id
-    user_data = storage._read_all().get(str(user_id), {})
+    users = storage.get_active_users()
     
-    stats_message = f"""📊 **THỐNG KÊ BOT**
+    stats_text = f"""📊 **THỐNG KÊ HỆ THỐNG**
 
-• 👥 Tổng người dùng: {stats['total_users']}
-• ✅ Đang hoạt động: {stats['active_users']}
-• 📨 Tổng tín hiệu đã gửi: {stats['total_signals']}
-• 🏦 Số sàn sử dụng: {len(EXCHANGES)}
-• ⏰ Quét mỗi: 5 phút
+👥 **Người dùng:**
+• Tổng: {stats['total_users']} user
+• Đang hoạt động: {stats['active_users']} user
+• Tín hiệu đã gửi: {stats['total_signals']}
 
-• 📈 Số tín hiệu bạn nhận: {user_data.get('signal_count', 0)}
-• 📅 Tham gia từ: {user_data.get('joined_at', 'N/A')}
+⚙️ **Hệ thống:**
+• Số sàn sử dụng: {len(EXCHANGES)}
+• Coins theo dõi: {len(SYMBOLS)}
+• Quét mỗi: 5 phút
+• Uptime: 24/7
 
-Bot đang chạy ổn định! 🚀"""
+🎯 **Coins đang scan:**
+{', '.join([s.replace('/USDT', '') for s in SYMBOLS])}
+
+📈 **Bot đang chạy ổn định!** 🚀"""
     
-    await update.message.reply_text(stats_message, parse_mode='Markdown')
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle unknown commands"""
     await update.message.reply_text(
-        "❓ Tôi không hiểu lệnh này.\n\n"
-        "Sử dụng /help để xem hướng dẫn."
+        "❓ Lệnh không hợp lệ.\n\n"
+        "Sử dụng:\n"
+        "/start - Đăng ký nhận tín hiệu\n"
+        "/help - Xem hướng dẫn\n"
+        "/stats - Xem thống kê"
     )
 
-# ==================== MAIN ====================
+# ==================== MAIN FUNCTION ====================
 def main():
-    """Main function to start the bot"""
+    """Start the bot"""
+    logger.info("🚀 Starting Signal Trading Bot...")
+    
     # Create Telegram application
     telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -367,47 +710,40 @@ def main():
     telegram_app.add_handler(CommandHandler("stats", stats_command))
     telegram_app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     
-    # Create and start scanner
+    # Create scanner
     scanner = SignalScanner(telegram_app)
     
-    # Start everything in separate threads
+    # Run Telegram bot in background thread
     def run_telegram():
-        """Run Telegram bot in separate thread"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         async def start_all():
             await telegram_app.initialize()
             await telegram_app.start()
-            
-            # Start scanner
-            scanner_task = asyncio.create_task(scanner.run())
-            
-            # Start polling
             await telegram_app.updater.start_polling()
             
-            # Keep running
-            await scanner_task
+            # Start scanner
+            await scanner.run()
         
         try:
             loop.run_until_complete(start_all())
         except KeyboardInterrupt:
             logger.info("Shutting down...")
-        finally:
             scanner.stop()
-            loop.run_until_complete(telegram_app.stop())
-            loop.close()
+        except Exception as e:
+            logger.error(f"Telegram thread error: {e}")
     
-    # Start Telegram in background thread
+    # Start Telegram thread
     telegram_thread = threading.Thread(target=run_telegram, daemon=True)
     telegram_thread.start()
     
-    logger.info("🤖 Bot started successfully!")
-    logger.info(f"🌐 Web interface: http://0.0.0.0:{PORT}")
-    logger.info(f"🔍 Scanning {len(SYMBOLS)} coins every {SCAN_INTERVAL} seconds")
+    logger.info(f"🤖 Bot started with token: {TELEGRAM_TOKEN[:10]}...")
+    logger.info(f"🌐 Web dashboard: http://0.0.0.0:{PORT}")
+    logger.info(f"🔍 Scanning {len(SYMBOLS)} coins every {SCAN_INTERVAL//60} minutes")
     
-    # Start Flask app in main thread
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    # Start Flask app (main thread)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     main()
