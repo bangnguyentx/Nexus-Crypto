@@ -13,7 +13,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from flask import Flask, jsonify
 
 from storage import Storage
-import analysis
+# Thay thế: import analysis
+from indicators import calculate_indicators_simple as calculate_indicators
+from indicators import check_signal  # giữ nguyên check_signal nếu có
 
 # ==================== CONFIG ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8322194930:AAEbemqNTWGAKoLwl23bwziKatEb6jx5ZIM")
